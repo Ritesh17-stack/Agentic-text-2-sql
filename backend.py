@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 from dotenv import load_dotenv
+
 # ==================== Configuration ====================
 load_dotenv()
 
@@ -38,13 +39,11 @@ class Config:
     @property
     def DATABASE_URL(self):
         from urllib.parse import quote_plus
-        # URL encode the password to handle special characters
         encoded_password = quote_plus(self.MYSQL_PASSWORD) if self.MYSQL_PASSWORD else ""
         
         if encoded_password:
             return f"mysql+pymysql://{self.MYSQL_USER}:{encoded_password}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
         else:
-            # No password case
             return f"mysql+pymysql://{self.MYSQL_USER}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
     
     MAX_RESULTS = 100
@@ -120,6 +119,103 @@ class SQLSafetyValidator:
             return f"{query.rstrip(';')} LIMIT {max_results}"
         
         return query
+
+# ==================== Schema Relevance Validator ====================
+class SchemaRelevanceValidator:
+    """Validates if user query is relevant to database schema"""
+    
+    @staticmethod
+    def extract_table_names(schema_info: str) -> List[str]:
+        """Extract all table names from schema info"""
+        tables = []
+        for line in schema_info.split('\n'):
+            if line.startswith('Table: '):
+                table_name = line.replace('Table: ', '').strip()
+                tables.append(table_name)
+        return tables
+    
+    @staticmethod
+    def extract_column_names(schema_info: str) -> List[str]:
+        """Extract all column names from schema info"""
+        columns = []
+        for line in schema_info.split('\n'):
+            if line.strip().startswith('- '):
+                
+                col_info = line.strip()[2:].split(':')[0].strip()
+                columns.append(col_info)
+        return columns
+    
+    @staticmethod
+    def check_schema_relevance(
+        user_question: str, 
+        schema_reasoning: str, 
+        schema_info: str,
+        available_tables: List[str]
+    ) -> tuple[bool, str]:
+        """
+        Check if the query is actually relevant to the database schema
+        Returns: (is_relevant, reason)
+        """
+        question_lower = user_question.lower()
+        reasoning_lower = schema_reasoning.lower()
+        
+        
+        non_db_indicators = [
+            'characteristics of',
+            'what is a',
+            'define',
+            'explain what',
+            'tell me about',
+            'describe a',
+            'how does a',
+            'why do',
+            'list facts about',
+            'properties of',
+            'features of',
+            'write a',
+            'create a story',
+            'poem about',
+            'joke about'
+        ]
+        
+        for indicator in non_db_indicators:
+            if indicator in question_lower:
+                return False, f"Query appears to be a general knowledge question, not a database query. This system only answers questions about the database."
+        
+        # Check if any actual table names are mentioned in the reasoning
+        tables_mentioned = []
+        for table in available_tables:
+            if table.lower() in reasoning_lower or table.lower() in question_lower:
+                tables_mentioned.append(table)
+        
+        # Check if reasoning mentions "no table" or similar
+        no_table_indicators = [
+            'no table',
+            'no relevant table',
+            'cannot find',
+            'does not exist',
+            'not available in the schema',
+            'schema does not contain',
+            'no appropriate table',
+            'database does not have',
+            'unable to find',
+            'no matching table',
+            'no suitable table'
+        ]
+        
+        for indicator in no_table_indicators:
+            if indicator in reasoning_lower:
+                return False, f"No relevant tables found in the database schema for this query. Available tables: {', '.join(available_tables)}"
+        
+        # If no tables mentioned in reasoning, it's likely not a valid DB query
+        if not tables_mentioned and len(available_tables) > 0:
+            return False, f"Query does not reference any tables in the database schema. Available tables: {', '.join(available_tables)}"
+        
+        # Additional check: if schema_info is empty or has no tables
+        if not available_tables or len(available_tables) == 0:
+            return False, "Database schema is empty or not available"
+        
+        return True, f"Query is relevant to database schema. Tables identified: {', '.join(tables_mentioned)}"
 
 # ==================== Database Manager ====================
 class DatabaseManager:
@@ -232,9 +328,11 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], "The messages in the conversation"]
     user_question: str
     schema_info: str
+    available_tables: list[str]  # NEW: Track available tables
     reasoning_steps: list[str]
     generated_sql: str
     is_sql_safe: bool
+    is_schema_relevant: bool  # NEW: Track schema relevance
     safety_message: str
     query_results: dict
     next_action: str
@@ -252,6 +350,7 @@ class NLToSQLAgent:
             temperature=0.1
         )
         self.validator = SQLSafetyValidator()
+        self.relevance_validator = SchemaRelevanceValidator()  # NEW
         self.workflow = self._create_workflow()
     
     def _create_workflow(self) -> StateGraph:
@@ -260,6 +359,7 @@ class NLToSQLAgent:
         
         workflow.add_node("understand_query", self._understand_query)
         workflow.add_node("reason_about_schema", self._reason_about_schema)
+        workflow.add_node("validate_relevance", self._validate_relevance)  # NEW NODE
         workflow.add_node("generate_sql", self._generate_sql)
         workflow.add_node("validate_sql", self._validate_sql)
         workflow.add_node("execute_query", self._execute_query)
@@ -269,7 +369,18 @@ class NLToSQLAgent:
         workflow.set_entry_point("understand_query")
         
         workflow.add_edge("understand_query", "reason_about_schema")
-        workflow.add_edge("reason_about_schema", "generate_sql")
+        workflow.add_edge("reason_about_schema", "validate_relevance")  # NEW EDGE
+        
+        
+        workflow.add_conditional_edges(
+            "validate_relevance",
+            lambda state: state["next_action"],
+            {
+                "generate": "generate_sql",
+                "error": "handle_error"
+            }
+        )
+        
         workflow.add_edge("generate_sql", "validate_sql")
         
         workflow.add_conditional_edges(
@@ -291,11 +402,16 @@ class NLToSQLAgent:
         """Step 1: Understand the user's natural language query"""
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are an expert at understanding natural language database queries.
-            Analyze the user's question and extract:
-            1. What data they want to retrieve
-            2. Any filters or conditions
-            3. Sorting or grouping requirements
-            4. Aggregations needed
+            Analyze the user's question and determine:
+            1. Is this a database-related question or a general knowledge question?
+            2. What data they want to retrieve (if database-related)
+            3. Any filters or conditions
+            4. Sorting or grouping requirements
+            5. Aggregations needed
+            
+            If the question is NOT about querying a database (e.g., "What are characteristics of a dog?", 
+            "Tell me a joke", "Define artificial intelligence"), clearly state that this is a general 
+            knowledge question, not a database query.
             
             Provide your analysis in a clear, structured format."""),
             ("user", "{question}")
@@ -312,6 +428,10 @@ class NLToSQLAgent:
     
     def _reason_about_schema(self, state: AgentState) -> AgentState:
         """Step 2: Reason about which tables and columns to use"""
+        # Extract available tables from schema
+        available_tables = self.relevance_validator.extract_table_names(state["schema_info"])
+        state["available_tables"] = available_tables
+        
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a MySQL database expert. Given the database schema and user question,
             identify which tables and columns are needed to answer the question.
@@ -319,11 +439,18 @@ class NLToSQLAgent:
             Database Schema:
             {schema}
             
-            Provide reasoning about:
-            1. Which tables to query
-            2. Which columns to select
+            IMPORTANT: If the user's question is NOT related to the database schema or asks about 
+            general knowledge (like "characteristics of dogs", "what is X", etc.), clearly state 
+            that NO TABLES are relevant and this cannot be answered from the database.
+            
+            If relevant tables exist, provide reasoning about:
+            1. Which specific tables to query (mention exact table names)
+            2. Which columns to select (mention exact column names)
             3. How tables should be joined (if multiple tables)
-            4. What WHERE conditions are needed"""),
+            4. What WHERE conditions are needed
+            
+            If NO relevant tables exist, clearly state: "No relevant tables found in the database schema for this query."
+            """),
             ("user", "User Question: {question}\n\nPrevious Understanding: {understanding}")
         ])
         
@@ -340,8 +467,33 @@ class NLToSQLAgent:
         
         return state
     
+    def _validate_relevance(self, state: AgentState) -> AgentState:
+        """Step 3: Validate if query is relevant to database schema - NEW STEP"""
+        schema_reasoning = state["reasoning_steps"][-1]  # Get the schema reasoning
+        
+        is_relevant, message = self.relevance_validator.check_schema_relevance(
+            user_question=state["user_question"],
+            schema_reasoning=schema_reasoning,
+            schema_info=state["schema_info"],
+            available_tables=state["available_tables"]
+        )
+        
+        if is_relevant:
+            state["is_schema_relevant"] = True
+            state["next_action"] = "generate"
+            state["reasoning_steps"].append(f"✓ Schema Relevance Check: {message}")
+        else:
+            state["is_schema_relevant"] = False
+            state["is_sql_safe"] = False
+            state["safety_message"] = f"Security Validation Failed: {message}"
+            state["next_action"] = "error"
+            state["reasoning_steps"].append(f"✗ Schema Relevance Check Failed: {message}")
+            state["generated_sql"] = ""  # No SQL will be generated
+        
+        return state
+    
     def _generate_sql(self, state: AgentState) -> AgentState:
-        """Step 3: Generate the SQL query"""
+        """Step 4: Generate the SQL query"""
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are an expert MySQL query generator. 
             Generate a SAFE, READ-ONLY SQL query based on the reasoning provided.
@@ -359,8 +511,8 @@ class NLToSQLAgent:
             7. Return ONLY the SQL query, no explanations
             8. Use MySQL-specific syntax and functions
             9. Give only query at a time without comments
-            10. Do not run the query if the user is asking something random
-            11. Use CONCAT() command for concatenation.
+            10. Use CONCAT() command for concatenation
+            11. Only use tables and columns that exist in the schema
             
             Previous Reasoning:
             {reasoning}"""),
@@ -389,7 +541,7 @@ class NLToSQLAgent:
         return state
     
     def _validate_sql(self, state: AgentState) -> AgentState:
-        """Step 4: Validate SQL for safety"""
+        """Step 5: Validate SQL for safety"""
         sql_query = state["generated_sql"]
         
         is_safe, message = self.validator.is_safe_query(sql_query)
@@ -400,17 +552,17 @@ class NLToSQLAgent:
             state["is_sql_safe"] = True
             state["safety_message"] = "Query validated successfully"
             state["next_action"] = "execute"
-            state["reasoning_steps"].append("Query passed safety validation")
+            state["reasoning_steps"].append("✓ SQL Safety Validation: Passed")
         else:
             state["is_sql_safe"] = False
-            state["safety_message"] = f"Safety validation failed: {message}"
+            state["safety_message"] = f"Security Validation Failed: {message}"
             state["next_action"] = "error"
-            state["reasoning_steps"].append(f"Safety validation failed: {message}")
+            state["reasoning_steps"].append(f"✗ SQL Safety Validation Failed: {message}")
         
         return state
     
     def _execute_query(self, state: AgentState) -> AgentState:
-        """Step 5: Execute the SQL query"""
+        """Step 6: Execute the SQL query"""
         try:
             columns, rows = self.db_manager.execute_query(state["generated_sql"])
             
@@ -425,19 +577,19 @@ class NLToSQLAgent:
                 "rows": rows,
                 "count": len(rows)
             }
-            state["reasoning_steps"].append(f"Query executed successfully. Retrieved {len(rows)} rows.")
+            state["reasoning_steps"].append(f"✓ Query executed successfully. Retrieved {len(rows)} rows.")
         except SQLAlchemyError as e:
             state["query_results"] = {
                 "error": str(e),
                 "columns": [],
                 "rows": []
             }
-            state["reasoning_steps"].append(f"Query execution error: {str(e)}")
+            state["reasoning_steps"].append(f"✗ Query execution error: {str(e)}")
         
         return state
     
     def _format_results(self, state: AgentState) -> AgentState:
-        """Step 6: Format results for user"""
+        """Step 7: Format results for user"""
         results = state["query_results"]
         
         if "error" in results:
@@ -450,21 +602,32 @@ class NLToSQLAgent:
     
     def _handle_error(self, state: AgentState) -> AgentState:
         """Handle errors in the workflow"""
-        message = f"Error: {state['safety_message']}"
+        message = f"❌ {state['safety_message']}"
         state["messages"].append(AIMessage(content=message))
+        state["query_results"] = {
+            "error": state["safety_message"],
+            "columns": [],
+            "rows": [],
+            "count": 0
+        }
         return state
     
     def process_query(self, user_question: str) -> dict:
         """Main method to process a natural language query"""
         start_time = datetime.now()
         
+        schema_info = self.db_manager.get_schema_info()
+        available_tables = self.relevance_validator.extract_table_names(schema_info)
+        
         initial_state = AgentState(
             messages=[HumanMessage(content=user_question)],
             user_question=user_question,
-            schema_info=self.db_manager.get_schema_info(),
+            schema_info=schema_info,
+            available_tables=available_tables,
             reasoning_steps=[],
             generated_sql="",
             is_sql_safe=False,
+            is_schema_relevant=False,  
             safety_message="",
             query_results={},
             next_action=""
@@ -487,8 +650,8 @@ class NLToSQLAgent:
 # ==================== FastAPI Application ====================
 app = FastAPI(
     title="NL to SQL Agent API",
-    description="Natural Language to SQL conversion with AI reasoning",
-    version="1.0.0"
+    description="Natural Language to SQL conversion with AI reasoning and security validation",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -515,12 +678,13 @@ async def startup_event():
         is_connected, message = db_manager.test_connection()
         
         if not is_connected:
-            print(f"⚠️ Warning: Database connection failed: {message}")
+            print(f"⚠️  Warning: Database connection failed: {message}")
             print(f"Please check your MySQL configuration in environment variables")
         else:
             print(f"✅ Connected to MySQL database: {config.MYSQL_DATABASE}")
             agent = NLToSQLAgent(config, db_manager)
             print("🤖 NL to SQL Agent initialized successfully!")
+            print("🛡️  Security features enabled: SQL Injection Prevention + Schema Relevance Validation")
     except Exception as e:
         print(f"❌ Startup error: {str(e)}")
 
@@ -528,13 +692,20 @@ async def startup_event():
 async def root():
     """Root endpoint"""
     return {
-        "message": "NL to SQL Agent API",
-        "version": "1.0.0",
+        "message": "NL to SQL Agent API with Enhanced Security",
+        "version": "2.0.0",
+        "security_features": [
+            "SQL Injection Prevention",
+            "Dangerous Keyword Blocking",
+            "Schema Relevance Validation",
+            "General Question Detection"
+        ],
         "endpoints": {
             "health": "/health",
             "schema": "/schema",
             "query": "/query (POST)",
-            "test_connection": "/test-connection"
+            "test_connection": "/test-connection",
+            "examples": "/examples"
         }
     }
 
@@ -603,9 +774,14 @@ async def get_examples():
     }
 
 if __name__ == "__main__":
-    print("🚀 Starting NL to SQL Agent API...")
+    print("🚀 Starting NL to SQL Agent API with Enhanced Security...")
     print(f"📊 Database: {config.MYSQL_DATABASE}@{config.MYSQL_HOST}")
     print(f"🔑 Groq API Key configured: {config.GROQ_API_KEY != 'your-groq-api-key-here'}")
+    print("🛡️  Security Features:")
+    print("   ✓ SQL Injection Prevention")
+    print("   ✓ Dangerous Keyword Blocking")
+    print("   ✓ Schema Relevance Validation")
+    print("   ✓ General Question Detection")
     print("\n" + "="*60)
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
