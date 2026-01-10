@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from dotenv import load_dotenv
 
-# ==================== Configuration ====================
+
 load_dotenv()
 
 class Config:
@@ -49,7 +49,7 @@ class Config:
     MAX_RESULTS = 100
     TIMEOUT_SECONDS = 30
 
-# ==================== Pydantic Models ====================
+
 class QueryRequest(BaseModel):
     question: str
     database: Optional[str] = None
@@ -67,7 +67,7 @@ class SchemaResponse(BaseModel):
     tables: List[Dict[str, Any]]
     relationships: List[Dict[str, Any]]
 
-# ==================== Safety Validator ====================
+# Safety Validator 
 class SQLSafetyValidator:
     """Validates SQL queries for safety before execution"""
     
@@ -120,7 +120,7 @@ class SQLSafetyValidator:
         
         return query
 
-# ==================== Schema Relevance Validator ====================
+# Schema Relevance Validator 
 class SchemaRelevanceValidator:
     """Validates if user query is relevant to database schema"""
     
@@ -217,7 +217,7 @@ class SchemaRelevanceValidator:
         
         return True, f"Query is relevant to database schema. Tables identified: {', '.join(tables_mentioned)}"
 
-# ==================== Database Manager ====================
+# Database Manager 
 class DatabaseManager:
     """Manages database connections and schema inspection"""
     
@@ -323,7 +323,7 @@ class DatabaseManager:
             rows = [dict(row._mapping) for row in result.fetchall()]
             return columns, rows
 
-# ==================== Agent State ====================
+# Agent State 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], "The messages in the conversation"]
     user_question: str
@@ -337,7 +337,7 @@ class AgentState(TypedDict):
     query_results: dict
     next_action: str
 
-# ==================== SQL Agent ====================
+# SQL Agent
 class NLToSQLAgent:
     """Agentic AI for Natural Language to SQL conversion with reasoning"""
     
@@ -468,7 +468,7 @@ class NLToSQLAgent:
         return state
     
     def _validate_relevance(self, state: AgentState) -> AgentState:
-        """Step 3: Validate if query is relevant to database schema - NEW STEP"""
+        """Step 3: Validate if query is relevant to database schema"""
         schema_reasoning = state["reasoning_steps"][-1]  # Get the schema reasoning
         
         is_relevant, message = self.relevance_validator.check_schema_relevance(
@@ -647,7 +647,7 @@ class NLToSQLAgent:
             "execution_time": execution_time
         }
 
-# ==================== FastAPI Application ====================
+# FastAPI Application 
 app = FastAPI(
     title="NL to SQL Agent API",
     description="Natural Language to SQL conversion with AI reasoning and security validation",
